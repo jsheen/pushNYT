@@ -1,0 +1,15 @@
+# Training hyperparameters — placeholder values, adjust for your model.
+seed: 42
+data:
+  train_path: data/train.csv
+  val_split: 0.2
+model:
+  name: baseline
+  hidden_dim: 128
+training:
+  epochs: 10
+  batch_size: 64
+  learning_rate: 0.001
+  num_workers: 2
+output:
+  dir: outputs
