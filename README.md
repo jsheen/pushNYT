@@ -1,5 +1,5 @@
 # pushNYT
-Push notification engine that could be utilized by The New York Times product. Balances engagement, discovery, and editorial judgment. Utilized Anthropic Claude Code.
+Push notification engine that could be utilized by The New York Times product. Balances engagement, discovery, and editorial judgment. Built as final project for AC215: MLOps and LLMOps: Production AI Systems at Harvard. Utilized Anthropic's Claude Code Pro.
 
 ## Containers
 
