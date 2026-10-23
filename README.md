@@ -4,6 +4,7 @@ Push notification engine that could be utilized by The New York Times product. B
 ## Containers
 
 ```bash
+./scripts/sync-data.sh            # pull gs://pushnyt-data into ./data (needs gcloud auth)
 ./docker-shell.sh                 # build image + interactive shell
 docker compose run --rm train     # build + run training with configs/train.yml
 docker compose run --rm shell     # interactive shell via compose
