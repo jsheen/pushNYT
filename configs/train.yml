@@ -1,15 +1,25 @@
-# Training hyperparameters — placeholder values, adjust for your model.
+# XGBoost click model on MIND: P(click | user, article, time slot)
 seed: 42
 data:
-  train_path: data/train.csv
-  val_split: 0.2
+  dir: data
+  behaviors: behaviors.tsv
+  news: news.tsv
+  entity_embeddings: entity_embedding.vec
+split:
+  # MIND-small train covers 2019-11-09 .. 2019-11-14
+  fit_end: "2019-11-13"    # earlier impressions: complement stats + user history only
+  train_end: "2019-11-14"  # [fit_end, train_end) trains the model; >= train_end is the test set
+features:
+  text_dim: 64             # TF-IDF -> SVD dimensions for article text
+  ctr_prior_strength: 5    # pseudo-impressions shrinking a user's slot engagement rate to the global rate
 model:
-  name: baseline
-  hidden_dim: 128
-training:
-  epochs: 10
-  batch_size: 64
-  learning_rate: 0.001
-  num_workers: 2
+  n_estimators: 1000
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_weight: 5
+  early_stopping_rounds: 50
+  valid_fraction: 0.2      # latest share of training rows used for early stopping
 output:
   dir: outputs
