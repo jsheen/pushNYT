@@ -13,6 +13,7 @@ from sklearn.metrics import log_loss, roc_auc_score
 
 from pushnyt.data import SLOTS, load_behaviors, load_entity_embeddings, load_news
 from pushnyt.features import FEATURES, build_features
+from pushnyt.plots import plot_importance
 
 
 def set_seed(seed: int) -> None:
@@ -80,6 +81,7 @@ def train(config: dict) -> None:
     model.save_model(output_dir / "xgb_click.json")
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     importance.rename("gain").to_csv(output_dir / "feature_importance.csv")
+    plot_importance(importance, output_dir / "feature_importance.png")
 
 
 def main() -> None:

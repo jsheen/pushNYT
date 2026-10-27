@@ -5,6 +5,7 @@ description = "Training pipeline for the pushNYT model"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "matplotlib>=3.8",
     "numpy>=2.0",
     "pandas>=2.2",
     "scikit-learn>=1.5",
