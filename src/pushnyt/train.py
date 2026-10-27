@@ -14,6 +14,7 @@ from sklearn.metrics import log_loss, roc_auc_score
 from pushnyt.data import SLOTS, load_behaviors, load_entity_embeddings, load_news
 from pushnyt.features import FEATURES, build_features
 from pushnyt.plots import plot_importance
+from pushnyt.vectordb import ArticleStore
 
 
 def set_seed(seed: int) -> None:
@@ -47,15 +48,20 @@ def train(config: dict) -> None:
     data_dir = Path(config["data"]["dir"])
     output_dir = Path(config["output"]["dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "config.yml").write_text(yaml.safe_dump(config, sort_keys=False))
+    features = [f for f in FEATURES if f not in config["features"].get("exclude", [])]
 
     print("loading data")
     beh = load_behaviors(data_dir / config["data"]["behaviors"])
     news = load_news(data_dir / config["data"]["news"])
     emb = load_entity_embeddings(data_dir / config["data"]["entity_embeddings"])
+    store = ArticleStore(data_dir / config["embeddings"]["chroma_dir"], config["embeddings"]["collection"])
+    abstract_vec = store.vectors(news["news_id"].tolist())
 
     print("building features")
     split = config["split"]
-    rows = build_features(beh, news, emb, pd.Timestamp(split["fit_end"]), config["features"], seed)
+    rows = build_features(beh, news, emb, abstract_vec, store, pd.Timestamp(split["fit_end"]),
+                          config["features"], seed)
     train_end = pd.Timestamp(split["train_end"])
     train_df = rows[rows["time"] < train_end]
     test_df = rows[rows["time"] >= train_end].reset_index(drop=True)
@@ -67,15 +73,15 @@ def train(config: dict) -> None:
     params = {k: v for k, v in config["model"].items() if k != "valid_fraction"}
     model = xgb.XGBClassifier(**params, tree_method="hist", eval_metric="auc",
                               random_state=seed, n_jobs=-1)
-    model.fit(fit_df[FEATURES], fit_df["label"],
-              eval_set=[(valid_df[FEATURES], valid_df["label"])], verbose=100)
+    model.fit(fit_df[features], fit_df["label"],
+              eval_set=[(valid_df[features], valid_df["label"])], verbose=100)
 
-    scores = model.predict_proba(test_df[FEATURES])[:, 1]
+    scores = model.predict_proba(test_df[features])[:, 1]
     metrics = evaluate(test_df, scores) | {"best_iteration": int(model.best_iteration)}
     print(json.dumps(metrics, indent=2))
 
     importance = pd.Series(model.get_booster().get_score(importance_type="gain"))
-    importance = importance.reindex(FEATURES).fillna(0).sort_values(ascending=False)
+    importance = importance.reindex(features).fillna(0).sort_values(ascending=False)
     print(importance.round(1).to_string())
 
     model.save_model(output_dir / "xgb_click.json")
@@ -87,9 +93,14 @@ def train(config: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/train.yml")
+    parser.add_argument("--exclude", nargs="*", default=[], help="features to leave out (ablations)")
+    parser.add_argument("--output-dir", help="overrides output.dir in the config")
     args = parser.parse_args()
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    config["features"]["exclude"] = config["features"].get("exclude", []) + args.exclude
+    if args.output_dir:
+        config["output"]["dir"] = args.output_dir
     train(config)
 
 

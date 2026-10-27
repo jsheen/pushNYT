@@ -12,6 +12,15 @@ split:
 features:
   text_dim: 64             # TF-IDF -> SVD dimensions for article text
   ctr_prior_strength: 5    # pseudo-impressions shrinking a user's slot engagement rate to the global rate
+  emb_top_k: 5             # emb_sim_top5: mean of the k most similar history articles
+  emb_close_threshold: 0.5 # emb_n_close: history articles at or above this cosine similarity
+  retrieval_k: 100         # emb_retrieval_rank: nearest articles retrieved per user
+  exclude: []              # features to leave out, e.g. [sim_text] for an ablation
+embeddings:
+  model: sentence-transformers/all-MiniLM-L6-v2  # 384-dim; downloaded to data/models
+  chroma_dir: chroma       # vector database, under data.dir
+  collection: abstracts
+  batch_size: 256
 model:
   n_estimators: 1000
   max_depth: 6

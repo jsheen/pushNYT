@@ -17,6 +17,8 @@ GROUPS = {
     "Complementarity": ("#1baf7a", {"complement_score"}),
     "Push fatigue": ("#eda100", {"slot_skipped_72h", "slot_skip_rate_72h", "impr_last_24h",
                                  "hours_since_last_impr", "hours_since_last_slot_impr"}),
+    "Embedding retrieval": ("#e87ba4", {"emb_sim_mean", "emb_sim_max", "emb_sim_top5", "emb_n_close",
+                                        "emb_retrieval_rank"}),
 }
 SURFACE, TEXT, TEXT_MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -26,7 +28,7 @@ def plot_importance(importance: pd.Series, path: Path) -> None:
     color = {f: c for c, feats in GROUPS.values() for f in feats}
     imp = importance.sort_values()
 
-    fig, ax = plt.subplots(figsize=(8, 5.6), facecolor=SURFACE)
+    fig, ax = plt.subplots(figsize=(8, 1.4 + 0.3 * len(imp)), facecolor=SURFACE)
     ax.set_facecolor(SURFACE)
     y = range(len(imp))
     ax.barh(y, imp.to_numpy(), height=0.6, color=[color.get(f, TEXT_MUTED) for f in imp.index])

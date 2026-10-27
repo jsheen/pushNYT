@@ -1,12 +1,14 @@
 """Features for predicting a click on (user, article) at a time slot (morning/afternoon/evening).
 
-Four feature groups:
+Five feature groups:
   - time-slot engagement: how the user has engaged in this slot before
   - similarity: candidate article vs. the user's reading history
   - complementarity: Alibaba-style s_ab = p_ab - q_ab over subcategories
     (https://eugeneyan.com/writing/push/), where p = "clicked b after reading a"
     and q = "clicked b instead of a" (a shown and skipped in the same impression)
   - push fatigue: articles recently shown and skipped in this slot, plus overall volume
+  - embedding retrieval: candidate vs. history in sentence-embedding space, using the
+    abstract vectors in the local vector database (see embed.py)
 
 Every per-user temporal feature uses only impressions strictly before the current one.
 """
@@ -21,6 +23,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
 from pushnyt.data import explode_impressions
+from pushnyt.vectordb import ArticleStore
 
 FEATURES = [
     # time-slot engagement
@@ -32,6 +35,8 @@ FEATURES = [
     # push fatigue
     "slot_skipped_72h", "slot_skip_rate_72h", "impr_last_24h",
     "hours_since_last_impr", "hours_since_last_slot_impr",
+    # embedding retrieval
+    "emb_sim_mean", "emb_sim_max", "emb_sim_top5", "emb_n_close", "emb_retrieval_rank",
 ]
 
 
@@ -141,7 +146,44 @@ def temporal_features(beh: pd.DataFrame, fit_end: pd.Timestamp, prior_strength: 
     return out
 
 
+def embedding_features(u: np.ndarray, a: np.ndarray, H: sparse.csr_matrix, abstract_vec: np.ndarray,
+                       store: ArticleStore, news_ids: np.ndarray, cfg: dict) -> pd.DataFrame:
+    """Candidate vs. the user's history articles in abstract-embedding space (cosine)."""
+    n = len(u)
+    out = {f: np.full(n, np.nan) for f in ("emb_sim_max", "emb_sim_top5", "emb_n_close")}
+    profile = normalize(H @ abstract_vec)
+    out["emb_sim_mean"] = np.einsum("ij,ij->i", profile[u], abstract_vec[a])
+
+    # max / top-k / count over the individual history articles, one user at a time
+    order = np.argsort(u, kind="stable")
+    users, starts = np.unique(u[order], return_index=True)
+    for user, idx in zip(users, np.split(order, starts[1:])):
+        hist = H.indices[H.indptr[user]:H.indptr[user + 1]]
+        if len(hist) == 0:
+            continue
+        sims = -np.sort(-(abstract_vec[a[idx]] @ abstract_vec[hist].T), axis=1)  # each row descending
+        out["emb_sim_max"][idx] = sims[:, 0]
+        out["emb_sim_top5"][idx] = sims[:, :cfg["emb_top_k"]].mean(1)
+        out["emb_n_close"][idx] = (sims >= cfg["emb_close_threshold"]).sum(1)
+
+    # rank of the candidate among the user's nearest articles in the vector database,
+    # skipping articles already in their history; k + 1 = not retrieved
+    k = cfg["retrieval_k"]
+    users = users[np.diff(H.indptr)[users] > 0]
+    nearest = store.nearest(profile[users], 2 * k)
+    news_pos = dict(zip(news_ids, range(len(news_ids))))
+    ranked = []
+    for user, ids in zip(users, nearest):
+        hist = set(H.indices[H.indptr[user]:H.indptr[user + 1]])
+        hits = [news_pos[i] for i in ids if news_pos[i] not in hist][:k]
+        ranked += [(user, art, r) for r, art in enumerate(hits, 1)]
+    ranks = pd.DataFrame(ranked, columns=["u", "a", "rank"]).set_index(["u", "a"])["rank"]
+    out["emb_retrieval_rank"] = ranks.reindex(pd.MultiIndex.from_arrays([u, a])).fillna(k + 1).to_numpy()
+    return pd.DataFrame(out)
+
+
 def build_features(beh: pd.DataFrame, news: pd.DataFrame, entity_emb: dict[str, np.ndarray],
+                   abstract_vec: np.ndarray, store: ArticleStore,
                    fit_end: pd.Timestamp, cfg: dict, seed: int) -> pd.DataFrame:
     """Feature rows for every candidate shown at or after `fit_end`.
 
@@ -179,6 +221,10 @@ def build_features(beh: pd.DataFrame, news: pd.DataFrame, entity_emb: dict[str, 
     rows["complement_score"] = complement_by_user[u, b] / np.where(other_weight > 1e-6, other_weight, np.nan)
     rows.loc[no_hist, ["sim_text", "sim_entity", "subcat_affinity", "complement_score"]] = np.nan
     rows.loc[rows["sim_entity"] == 0, "sim_entity"] = np.nan  # article or history has no entities
+
+    emb_cols = embedding_features(u, a, H, abstract_vec, store, news["news_id"].to_numpy(), cfg)
+    rows[emb_cols.columns] = emb_cols.to_numpy()
+    rows.loc[no_hist, emb_cols.columns] = np.nan
 
     temporal = temporal_features(beh, fit_end, cfg["ctr_prior_strength"])
     rows = rows.join(temporal, on="row")
