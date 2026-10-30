@@ -1,5 +1,7 @@
 # pushNYT
 
+[![CI](https://github.com/jsheen/pushNYT/actions/workflows/ci.yml/badge.svg)](https://github.com/jsheen/pushNYT/actions/workflows/ci.yml)
+
 Push notification engine that could be utilized by The New York Times product. Balances engagement, discovery, and editorial judgment. Built as final project for AC215: MLOps and LLMOps: Production AI Systems at Harvard. Utilized Anthropic's Claude Code Pro.
 
 ## Overview
@@ -35,6 +37,8 @@ gs://pushnyt-data ──sync-data.sh──▶ data/
                                      │
                                      ▼
           outputs/<run>/objective/  (engagement-vs-novelty tradeoff, chosen pushes)
+
+          outputs/<run>/predictions.parquet ──▶ pushnyt-api  (api container, :8000)
 ```
 
 1. **Sync data** — `scripts/sync-data.sh` pulls the MIND files from the project's GCS bucket.
@@ -47,6 +51,7 @@ gs://pushnyt-data ──sync-data.sh──▶ data/
 4. **Objective** — `pushnyt-objective` re-ranks those predictions with the push objective below
    (engagement vs. novelty, set by a friction parameter). It runs in its own lightweight image, so
    friction can be changed in seconds without retraining.
+5. **Serve** — `pushnyt-api` exposes scores and push decisions over HTTP (see [API](#api)).
 
 ### Time-based split
 
@@ -82,6 +87,10 @@ It also reports bootstrap confidence intervals (`ci`) for AUC, group AUC, and AU
 Whole impressions are resampled, since the candidates shown together are correlated, and each
 replicate reweights the rows by how often its impression was drawn. The number of replicates and
 the interval level are set under `evaluation` in `configs/train.yml` (`bootstrap_samples: 0` skips this).
+
+**Quality gate.** If test AUC falls below `evaluation.min_auc` (0.644, the lower bound of the
+baseline's 95% CI), `pushnyt-train` exits with an error after saving its artifacts, so a regression
+can't pass silently but the failed run can still be inspected. Remove the setting to disable it.
 
 ### Results
 
@@ -178,10 +187,15 @@ src/pushnyt/
   features.py           # feature engineering
   train.py              # pushnyt-train: fit, evaluate, save artifacts
   objective.py          # pushnyt-objective: engagement vs. novelty re-ranking
-  plots.py              # feature-importance chart
+  api.py                # pushnyt-api: FastAPI serving app
+  plots.py              # feature-importance and trade-off charts
+tests/                  # pytest suite on synthetic MIND-style data
+.github/workflows/      # ci.yml (lint, test, build images), release.yml (publish images)
 Dockerfile              # training image (torch, xgboost, chroma: the `train` extra)
-Dockerfile.objective    # objective image (numpy, pandas, pyarrow only)
+Dockerfile.objective    # objective image (numpy, pandas, pyarrow, matplotlib)
+Dockerfile.api          # API image (core deps + the `api` extra: fastapi, uvicorn)
 docker-compose.yml, docker-shell.sh
+docs/                   # images used by this README
 data/                   # git-ignored; populated by sync-data.sh and pushnyt-embed
 outputs/                # git-ignored; one folder of artifacts per run
 ```
@@ -201,12 +215,15 @@ outputs/                # git-ignored; one folder of artifacts per run
 ./docker-shell.sh                 # build image + interactive shell
 docker compose run --rm train     # build + run training with configs/train.yml
 docker compose run --rm objective # build + run the push objective with configs/objective.yml
+docker compose up -d api          # build + start the serving API on http://localhost:8000
 docker compose run --rm shell     # interactive shell via compose (training image)
 ```
 
-There are two images. `pushnyt-train` holds the heavy training stack (`pip install .[train]`);
+There are three images. `pushnyt-train` holds the heavy training stack (`pip install .[train]`);
 `pushnyt-objective` holds only the core dependencies and mounts just `src/`, `configs/`, and
-`outputs/`. The only thing passed between them is a run's `predictions.parquet`.
+`outputs/`; `pushnyt-api` adds FastAPI to the core dependencies and mounts `outputs/` read-only.
+They never call each other: the only thing passed between them is a run's
+`predictions.parquet`, through the shared `outputs/` folder.
 
 `src/`, `configs/`, `data/`, and `outputs/` are bind-mounted, so code and config edits
 take effect without rebuilding. Rebuild after changing `pyproject.toml`.
@@ -259,6 +276,66 @@ docker compose run --rm objective \
 
 `run_dir`, `friction`, the friction `sweep`, and the random baseline's `seed` default from
 `configs/objective.yml`.
+
+### API
+
+```bash
+docker compose up -d api      # serves outputs/recency-depth-no-emb by default
+PUSHNYT_RUN_DIR=outputs/full docker compose up -d api   # serve a different run
+docker compose down           # stop it
+```
+
+Interactive docs are at <http://localhost:8000/docs>.
+
+| Endpoint | Does |
+|----------|------|
+| `GET /health` | Liveness, plus which run is loaded |
+| `GET /model` | Run name, excluded features, test metrics |
+| `GET /users/{user_id}/impressions` | A user's impressions in the run, to find ids to score |
+| `POST /score` | `P(click)` and novelty for an impression's candidates, highest first |
+| `POST /push` | The push the objective picks at a given `friction` (default 0.2), with its engagement and novelty ranks and the next four candidates |
+
+```bash
+curl localhost:8000/users/U86598/impressions
+curl -X POST localhost:8000/push -H 'content-type: application/json' \
+  -d '{"impression_id": 152636, "friction": 0.2}'
+```
+
+Both `POST` endpoints accept an optional `news_ids` list to restrict the choice to a subset of the
+impression's candidates. Friction outside [0, 1] returns 422; unknown impressions or articles return 404.
+
+**Limitation:** the API serves a run's precomputed test-day predictions, so it only knows the
+impressions in that run's `predictions.parquet`. Scoring live requests would need each user's
+features (history, recent skips, exposure) computed online from a feature store.
+
+## Development
+
+### Tests
+
+```bash
+docker compose run --rm -v "$PWD/tests:/app/tests" train "uv sync --extra train --extra api --extra dev && ruff check src tests && pytest"
+# or locally: uv sync --extra train --extra api --extra dev && uv run pytest
+```
+
+The suite builds a tiny synthetic MIND-style dataset (`tests/conftest.py`), so it needs no real data
+or vector database. It covers the AUC/bootstrap math and quality gate, the objective (friction
+bounds and endpoints, scale-invariance), the no-lookahead guarantees of the recency and novelty
+features, an end-to-end train → objective run, and every API endpoint.
+
+### CI/CD
+
+- **CI** (`.github/workflows/ci.yml`), on every push to `main` and every pull request: `ruff`,
+  `pytest`, and a build of all three Docker images (not pushed).
+- **Release** (`.github/workflows/release.yml`), when a version tag is pushed: builds the three
+  images and publishes them to GitHub Container Registry as
+  `ghcr.io/jsheen/pushnyt-{train,objective,api}`, tagged with the version and `latest`:
+
+  ```bash
+  git tag v0.2.0 && git push origin v0.2.0
+  ```
+
+Training on the real data is not part of CI (it needs the GCS data); the quality gate guards it when
+you run it.
 
 ### Outputs
 

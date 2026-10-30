@@ -161,7 +161,7 @@ def article_first_seen(beh: pd.DataFrame, rows: pd.DataFrame, H: sparse.csr_matr
     Articles in a pre-period click history predate the log, so they are capped at its start
     (their age is then a lower bound). Never-seen articles are NaT.
     """
-    first = np.full(H.shape[1], np.datetime64("NaT"), "datetime64[ns]")
+    first = np.full(H.shape[1], np.datetime64("NaT", "ns"), "datetime64[ns]")
     shown = pd.Series(beh["time"].to_numpy()[rows["row"]]).groupby(rows["news"].to_numpy()).min()
     first[shown.index] = shown.to_numpy()
     in_history = np.diff(H.tocsc().indptr) > 0

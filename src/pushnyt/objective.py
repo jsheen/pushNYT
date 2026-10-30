@@ -29,12 +29,18 @@ def _rank(values, groups: np.ndarray) -> np.ndarray:
     return pd.Series(np.asarray(values)).groupby(groups).rank(pct=True).to_numpy()
 
 
+def objective_parts(df: pd.DataFrame, p_click: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Engagement and novelty, each as a percentile rank within its impression."""
+    imp = df["impression_id"].to_numpy()
+    return _rank(p_click, imp), _rank(df["novelty"], imp)
+
+
 def push_scores(df: pd.DataFrame, p_click: np.ndarray, friction: float) -> np.ndarray:
     """Objective score for each candidate; push the highest one in each impression."""
     if not 0 <= friction <= 1:
         raise ValueError(f"friction must be in [0, 1], got {friction}")
-    imp = df["impression_id"].to_numpy()
-    return (1 - friction) * _rank(p_click, imp) + friction * _rank(df["novelty"], imp)
+    engage, novel = objective_parts(df, p_click)
+    return (1 - friction) * engage + friction * novel
 
 
 def tradeoff(df: pd.DataFrame, p_click: np.ndarray, frictions: list[float]) -> pd.DataFrame:
@@ -44,7 +50,7 @@ def tradeoff(df: pd.DataFrame, p_click: np.ndarray, frictions: list[float]) -> p
     the top pick; new_subcat_at_1: share of top picks from a subcategory never shown before.
     """
     imp = df["impression_id"].to_numpy()
-    engage, novel = _rank(p_click, imp), _rank(df["novelty"], imp)
+    engage, novel = objective_parts(df, p_click)
     out = []
     for f in frictions:
         score = pd.Series((1 - f) * engage + f * novel)

@@ -78,6 +78,13 @@ def evaluate(df: pd.DataFrame, scores: np.ndarray, cfg: dict, seed: int) -> dict
     return metrics
 
 
+def check_quality(metrics: dict, cfg: dict) -> None:
+    """Quality gate: fail the run if test AUC is below evaluation.min_auc (unset = no gate)."""
+    min_auc = cfg.get("min_auc")
+    if min_auc is not None and metrics["auc"] < min_auc:
+        raise SystemExit(f"quality gate failed: test AUC {metrics['auc']:.4f} < min_auc {min_auc}")
+
+
 def train(config: dict) -> None:
     seed = config["seed"]
     set_seed(seed)
@@ -130,6 +137,7 @@ def train(config: dict) -> None:
     test_df.assign(news_id=news["news_id"].to_numpy()[test_df["news"]], p_click=scores)[
         ["impression_id", "user_id", "time", "slot", "news_id", "label", "p_click", "novelty"]
     ].to_parquet(output_dir / "predictions.parquet", index=False)
+    check_quality(metrics, config.get("evaluation", {}))  # after saving, so a failed run can be inspected
     plot_importance(importance, output_dir / "feature_importance.png")
 
 

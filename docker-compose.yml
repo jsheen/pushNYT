@@ -32,6 +32,21 @@ services:
       - ./outputs:/app/outputs
     command: ["pushnyt-objective --config configs/objective.yml"]
 
+  # Serving API on http://localhost:8000 (docs at /docs). PUSHNYT_RUN_DIR picks the run to serve.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: pushnyt-api:latest
+    container_name: pushnyt-api
+    environment:
+      - PUSHNYT_RUN_DIR=${PUSHNYT_RUN_DIR:-outputs/recency-depth-no-emb}
+    volumes:
+      - ./src:/app/src
+      - ./outputs:/app/outputs:ro
+    ports:
+      - "8000:8000"
+
   # Interactive dev shell: `docker compose run --rm shell`
   shell:
     extends: train
