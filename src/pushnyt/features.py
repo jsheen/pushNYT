@@ -169,6 +169,27 @@ def article_first_seen(beh: pd.DataFrame, rows: pd.DataFrame, H: sparse.csr_matr
     return first
 
 
+def subcat_novelty(rows: pd.DataFrame, H: sparse.csr_matrix, subcat: np.ndarray, n_sub: int) -> np.ndarray:
+    """1 - share of the user's earlier exposure that was in the candidate's subcategory.
+
+    Exposure = pre-period history clicks plus articles shown in earlier impressions (not the
+    current one). 1 = never shown this subcategory; users with no exposure at all get 1.
+    Not a model feature: it is the novelty half of the push objective (see objective.py).
+    """
+    u, b, r = rows["user"].to_numpy(), rows["subcat"].to_numpy(), rows["row"].to_numpy()
+    per_sub = rows.groupby(["user", "subcat", "row"]).size()
+    per_row = rows.groupby(["user", "row"]).size()
+    prior_sub = (per_sub.groupby(level=[0, 1]).cumsum() - per_sub).reindex(
+        pd.MultiIndex.from_arrays([u, b, r])).to_numpy()
+    prior_all = (per_row.groupby(level=0).cumsum() - per_row).reindex(
+        pd.MultiIndex.from_arrays([u, r])).to_numpy()
+    hist_sub = (H @ _onehot(subcat, n_sub)).toarray()[u, b]
+    hist_all = np.diff(H.indptr)[u]
+    total = prior_all + hist_all
+    share = (prior_sub + hist_sub) / np.where(total > 0, total, 1)
+    return 1.0 - share
+
+
 def embedding_features(u: np.ndarray, a: np.ndarray, H: sparse.csr_matrix, abstract_vec: np.ndarray,
                        store: ArticleStore, news_ids: np.ndarray, cfg: dict) -> pd.DataFrame:
     """Candidate vs. the user's history articles in abstract-embedding space (cosine)."""
@@ -231,6 +252,7 @@ def build_features(beh: pd.DataFrame, news: pd.DataFrame, entity_emb: dict[str, 
     rows["subcat"] = subcat[rows["news"]]
     is_fit = (beh["time"] < fit_end).to_numpy()[rows["row"]]
     first_seen = article_first_seen(beh, rows, H)  # uses all rows; min over times <= t never looks ahead
+    rows["novelty"] = subcat_novelty(rows, H, subcat, n_sub)
 
     s = fit_complements(rows[is_fit], sparse.csr_matrix(subcat_weights > 0), n_sub)
     complement_by_user = subcat_weights @ s  # weighted mean of s[a, b] over the user's subcategories a
@@ -258,6 +280,7 @@ def build_features(beh: pd.DataFrame, news: pd.DataFrame, entity_emb: dict[str, 
     rows = rows.join(temporal, on="row")
     rows["slot"] = beh["slot"].to_numpy()[rows["row"]]
     rows["impression_id"] = beh["impression_id"].to_numpy()[rows["row"]]
+    rows["user_id"] = beh["user_id"].to_numpy()[rows["row"]]
     rows["time"] = beh["time"].to_numpy()[rows["row"]]
     rows["article_age_hours"] = (rows["time"].to_numpy() - first_seen[a]) / np.timedelta64(1, "h")
     return rows

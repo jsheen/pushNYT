@@ -26,10 +26,15 @@ gs://pushnyt-data ──sync-data.sh──▶ data/
                                      │
  behaviors.tsv + news.tsv + entity embeddings + chroma
                                      │
-                              pushnyt-train
+                              pushnyt-train            (train container)
                                      │
                                      ▼
-          outputs/  (model, metrics, feature importance)
+          outputs/<run>/  (model, metrics, feature importance, predictions.parquet)
+                                     │
+                            pushnyt-objective          (objective container)
+                                     │
+                                     ▼
+          outputs/<run>/objective/  (engagement-vs-novelty tradeoff, chosen pushes)
 ```
 
 1. **Sync data** — `scripts/sync-data.sh` pulls the MIND files from the project's GCS bucket.
@@ -37,7 +42,11 @@ gs://pushnyt-data ──sync-data.sh──▶ data/
    the abstract is empty) with `sentence-transformers/all-MiniLM-L6-v2` and stores the vectors
    in Chroma (`data/chroma`, collection `abstracts`).
 3. **Train** — `pushnyt-train` builds features, trains XGBoost with early stopping, evaluates on
-   a held-out day, and writes artifacts to `outputs/`.
+   a held-out day, and writes artifacts to `outputs/<run>/`, including per-candidate test-set
+   predictions in `predictions.parquet`.
+4. **Objective** — `pushnyt-objective` re-ranks those predictions with the push objective below
+   (engagement vs. novelty, set by a friction parameter). It runs in its own lightweight image, so
+   friction can be changed in seconds without retraining.
 
 ### Time-based split
 
@@ -90,10 +99,77 @@ impression-level bootstrap CIs (1,000 replicates):
 
 `article_age_hours` ranks third by gain, behind `subcat_affinity` and `sim_text`.
 
+### Push objective
+
+The click model answers "will they click?"; the push objective decides what to actually send.
+For each candidate in an impression:
+
+```
+score = (1 − friction) · engagement + friction · novelty,     friction ∈ [0, 1]
+```
+
+- **engagement** — the XGBoost `P(click)`.
+- **novelty** — `1 − share of the user's earlier exposure in the candidate's subcategory`, where
+  exposure is their pre-period history clicks plus every article shown in earlier impressions.
+  1 = a subcategory they have never been shown; near 0 = what they are usually shown.
+
+**Putting the two halves on the same scale.** The raw values are not comparable: `P(click)` sits in
+a narrow band near the base CTR (~0.04), while novelty spans 0–1 (and is close to 1 for most
+subcategories). Adding them raw would let novelty swamp engagement at almost any friction, and
+the meaning of a given friction would shift whenever the model's calibration changed. So each half
+is converted to its **percentile rank among the candidates in the same impression** — the set we
+choose one push from. Both then mean "the share of the other candidates this one beats", on the
+same 0–1 scale, and friction becomes a literal weight between two rankings: at 0.2, the push is
+80% "most likely to be clicked" and 20% "least like what they usually get". Ranks also make the
+objective unaffected by any monotone rescaling of `P(click)` (e.g. recalibration).
+
+**Baseline click rates.** Clicks are rare. On the test day (30,270 impressions, 1.22M candidates):
+
+| What | Click rate |
+|------|------------|
+| Any single candidate shown | 3.8% |
+| One candidate picked at random from each impression | 9.1% |
+| The model's top pick per impression (friction 0) | 16.7% |
+
+A random pick beats the per-candidate rate because MIND only logs impressions with at least one
+click, and short impressions have a high click share (impressions hold 40 candidates on average,
+median 27). So 9.1% is the fair "pick one push at random" baseline, and the click model nearly
+doubles it. MIND impressions are on-site feed impressions rather than push notifications, so
+absolute push click rates in production would be lower.
+
+**The trade-off.** `pushnyt-objective` sweeps friction and plots, for the single top push per
+impression, the click rate against the share of pushes from a never-shown subcategory. The dashed
+curve repeats the same objective with the click model swapped for a random ranking, so the gap
+between the curves is what the model adds at each level of novelty (`recency-depth-no-emb` model):
+
+![Push objective trade-off](docs/tradeoff.png)
+
+| Friction | CTR of top pick | …with random engagement | Top pick from a never-shown subcategory |
+|----------|-----------------|-------------------------|-----------------------------------------|
+| 0 | 16.7% | 9.1% | 11% |
+| 0.05 | 16.3% | 9.0% | 16% |
+| 0.1 | 15.4% | 8.8% | 23% |
+| 0.15 | 14.7% | 8.7% | 31% |
+| 0.2 (default) | 13.9% | 8.5% | 37% |
+| 0.3 | 12.6% | 8.2% | 48% |
+| 0.4 | 11.8% | 8.0% | 56% |
+| 0.5 | 11.0% | 8.0% | 64% |
+| 0.7 | 10.0% | 8.0% | 76% |
+| 1 | 8.1% | 8.1% | 87% |
+
+The never-shown share in the third column is for the model; under random engagement it is higher
+at low friction (29% at friction 0), since a random ranking ignores the user's habits. The two
+curves meet at friction 1, where engagement is ignored. Low friction buys a lot of novelty cheaply:
+going from 0 to 0.2 more than triples the never-shown share for about 3 points of CTR. Above
+roughly 0.5 the model keeps less and less of its edge. CTR is measured against logged clicks, so
+it only credits pushes that were in the original candidate set, which likely understates how
+novel pushes would do.
+
 ## Repository layout
 
 ```
 configs/train.yml       # all data, split, feature, embedding, and model settings
+configs/objective.yml   # push objective: which run to re-rank, friction, sweep
 scripts/sync-data.sh    # pull gs://pushnyt-data into ./data
 src/pushnyt/
   data.py               # MIND loaders, time-slot bucketing
@@ -101,8 +177,11 @@ src/pushnyt/
   vectordb.py           # thin Chroma wrapper (add / fetch vectors / nearest neighbors)
   features.py           # feature engineering
   train.py              # pushnyt-train: fit, evaluate, save artifacts
+  objective.py          # pushnyt-objective: engagement vs. novelty re-ranking
   plots.py              # feature-importance chart
-Dockerfile, docker-compose.yml, docker-shell.sh
+Dockerfile              # training image (torch, xgboost, chroma: the `train` extra)
+Dockerfile.objective    # objective image (numpy, pandas, pyarrow only)
+docker-compose.yml, docker-shell.sh
 data/                   # git-ignored; populated by sync-data.sh and pushnyt-embed
 outputs/                # git-ignored; one folder of artifacts per run
 ```
@@ -121,8 +200,13 @@ outputs/                # git-ignored; one folder of artifacts per run
 ./scripts/sync-data.sh            # pull gs://pushnyt-data into ./data (needs gcloud auth)
 ./docker-shell.sh                 # build image + interactive shell
 docker compose run --rm train     # build + run training with configs/train.yml
-docker compose run --rm shell     # interactive shell via compose
+docker compose run --rm objective # build + run the push objective with configs/objective.yml
+docker compose run --rm shell     # interactive shell via compose (training image)
 ```
+
+There are two images. `pushnyt-train` holds the heavy training stack (`pip install .[train]`);
+`pushnyt-objective` holds only the core dependencies and mounts just `src/`, `configs/`, and
+`outputs/`. The only thing passed between them is a run's `predictions.parquet`.
 
 `src/`, `configs/`, `data/`, and `outputs/` are bind-mounted, so code and config edits
 take effect without rebuilding. Rebuild after changing `pyproject.toml`.
@@ -165,6 +249,17 @@ pushnyt-train --config configs/train.yml \
 Hyperparameters, split dates, and feature settings all live in `configs/train.yml`. The resolved
 config is copied into the output directory with each run.
 
+### Objective options
+
+```bash
+# re-rank a run's predictions at a different friction (no retraining)
+docker compose run --rm objective \
+  "pushnyt-objective --run-dir outputs/recency-depth-no-emb --friction 0.3"
+```
+
+`run_dir`, `friction`, the friction `sweep`, and the random baseline's `seed` default from
+`configs/objective.yml`.
+
 ### Outputs
 
 Each run writes to its own folder under `outputs/`, `outputs/full` by default (`output.dir` in the
@@ -172,7 +267,6 @@ config, or `--output-dir`):
 
 ```
 outputs/
-  baseline/               # Oct 23 run, before embedding retrieval existed (same model as baseline-no-emb)
   baseline-no-emb/        # original groups minus embedding retrieval
   recency-depth-no-emb/   # adds article recency + user depth, minus embedding retrieval
   full/                   # default: every feature group
@@ -185,6 +279,11 @@ outputs/
 | `feature_importance.csv` | Gain per feature |
 | `feature_importance.png` | Feature-importance chart, colored by feature group |
 | `config.yml` | Config used for the run |
+| `predictions.parquet` | Test-set candidates: impression, user, slot, article, label, `p_click`, `novelty` |
+| `objective/tradeoff.csv` | Top-pick CTR and novelty at each friction, for the model and the random-ranking baseline |
+| `objective/tradeoff.png` | Trade-off plot: top-pick CTR vs. never-shown share, model vs. random |
+| `objective/pushes.parquet` | The chosen push per impression at the configured friction, with its score |
+| `objective/summary.json` | Tradeoff row for the configured friction |
 
 ## Status and contact
 

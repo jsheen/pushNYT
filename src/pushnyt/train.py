@@ -126,6 +126,10 @@ def train(config: dict) -> None:
     model.save_model(output_dir / "xgb_click.json")
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     importance.rename("gain").to_csv(output_dir / "feature_importance.csv")
+    # handoff to the push objective (pushnyt-objective), which runs in its own container
+    test_df.assign(news_id=news["news_id"].to_numpy()[test_df["news"]], p_click=scores)[
+        ["impression_id", "user_id", "time", "slot", "news_id", "label", "p_click", "novelty"]
+    ].to_parquet(output_dir / "predictions.parquet", index=False)
     plot_importance(importance, output_dir / "feature_importance.png")
 
 

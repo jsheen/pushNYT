@@ -19,6 +19,19 @@ services:
     command: ["pushnyt-train --config configs/train.yml"]
     shm_size: "2gb"   # PyTorch DataLoader workers need shared memory
 
+  # Push objective: re-ranks a run's predictions.parquet. Needs only outputs/, not data/.
+  objective:
+    build:
+      context: .
+      dockerfile: Dockerfile.objective
+    image: pushnyt-objective:latest
+    container_name: pushnyt-objective
+    volumes:
+      - ./src:/app/src
+      - ./configs:/app/configs
+      - ./outputs:/app/outputs
+    command: ["pushnyt-objective --config configs/objective.yml"]
+
   # Interactive dev shell: `docker compose run --rm shell`
   shell:
     extends: train

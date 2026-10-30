@@ -1,23 +1,27 @@
 [project]
 name = "pushnyt"
 version = "0.1.0"
-description = "Training pipeline for the pushNYT model"
+description = "Training pipeline and push objective for the pushNYT model"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
+# Core deps are all the objective image needs; the training image adds the `train` extra.
 dependencies = [
-    "chromadb>=0.5",
     "matplotlib>=3.8",
     "numpy>=2.0",
     "pandas>=2.2",
+    "pyarrow>=16.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "chromadb>=0.5",
     "scikit-learn>=1.5",
     "sentence-transformers>=3.0",
-    "pyyaml>=6.0",
     "torch>=2.4",
     "tqdm>=4.66",
     "xgboost>=2.1",
 ]
-
-[project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
@@ -27,6 +31,7 @@ dev = [
 [project.scripts]
 pushnyt-train = "pushnyt.train:main"
 pushnyt-embed = "pushnyt.embed:main"
+pushnyt-objective = "pushnyt.objective:main"
 
 [build-system]
 requires = ["hatchling"]
