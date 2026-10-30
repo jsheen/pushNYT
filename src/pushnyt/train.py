@@ -12,7 +12,7 @@ import yaml
 from sklearn.metrics import log_loss, roc_auc_score
 
 from pushnyt.data import SLOTS, load_behaviors, load_entity_embeddings, load_news
-from pushnyt.features import FEATURES, build_features
+from pushnyt.features import EMBEDDING_FEATURES, FEATURES, build_features
 from pushnyt.plots import plot_importance
 from pushnyt.vectordb import ArticleStore
 
@@ -22,23 +22,59 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def group_auc(df: pd.DataFrame, scores: np.ndarray) -> float:
-    """Mean AUC within impressions that have both a click and a non-click (MIND's metric)."""
-    aucs = [roc_auc_score(g["label"], g["score"])
-            for _, g in df.assign(score=scores).groupby("impression_id") if g["label"].nunique() == 2]
-    return float(np.mean(aucs))
+def impression_aucs(df: pd.DataFrame, scores: np.ndarray) -> pd.Series:
+    """AUC within each impression that has both a click and a non-click; the mean is group AUC."""
+    return pd.Series({i: roc_auc_score(g["label"], g["score"])
+                      for i, g in df.assign(score=scores).groupby("impression_id") if g["label"].nunique() == 2})
 
 
-def evaluate(df: pd.DataFrame, scores: np.ndarray) -> dict:
+def _weighted_auc(rank: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
+    """AUC with row weights; `rank` is the dense rank of each score, so ties count as half."""
+    pos, neg = np.bincount(rank, w * y), np.bincount(rank, w * (1 - y))
+    below = np.cumsum(neg) - neg
+    return float((pos * (below + 0.5 * neg)).sum() / (pos.sum() * neg.sum()))
+
+
+def bootstrap_ci(df: pd.DataFrame, scores: np.ndarray, imp_auc: pd.Series,
+                 n: int, level: float, seed: int) -> dict:
+    """Percentile CIs for AUC, group AUC, and AUC by slot.
+
+    Resamples whole impressions, since candidates shown together are correlated; each
+    replicate reweights rows by how often their impression was drawn.
+    """
+    rng = np.random.default_rng(seed)
+    imp, imp_ids = df["impression_id"].factorize()
+    imp_auc_pos = imp_ids.get_indexer(imp_auc.index)
+    rank = np.unique(scores, return_inverse=True)[1]
+    y = df["label"].to_numpy(float)
+    slots = {SLOTS[s]: df["slot"].to_numpy() == s for s in np.unique(df["slot"])}
+    draws = {"auc": [], "group_auc": [], **{s: [] for s in slots}}
+    for _ in range(n):
+        counts = np.bincount(rng.integers(0, len(imp_ids), len(imp_ids)), minlength=len(imp_ids))
+        w = counts[imp].astype(float)
+        draws["auc"].append(_weighted_auc(rank, y, w))
+        draws["group_auc"].append(float(np.average(imp_auc.to_numpy(), weights=counts[imp_auc_pos])))
+        for s, m in slots.items():
+            draws[s].append(_weighted_auc(rank[m], y[m], w[m]))
+    tail = 100 * (1 - level) / 2
+    ci = {k: [float(x) for x in np.percentile(v, [tail, 100 - tail])] for k, v in draws.items()}
+    return {"level": level, "samples": n, "auc": ci.pop("auc"), "group_auc": ci.pop("group_auc"),
+            "auc_by_slot": ci}
+
+
+def evaluate(df: pd.DataFrame, scores: np.ndarray, cfg: dict, seed: int) -> dict:
+    imp_auc = impression_aucs(df, scores)
     metrics = {
         "rows": len(df),
         "ctr": float(df["label"].mean()),
         "auc": float(roc_auc_score(df["label"], scores)),
         "logloss": float(log_loss(df["label"], scores)),
-        "group_auc": group_auc(df, scores),
+        "group_auc": float(imp_auc.mean()),
     }
     metrics["auc_by_slot"] = {SLOTS[s]: float(roc_auc_score(g["label"], scores[g.index]))
                               for s, g in df.reset_index(drop=True).groupby("slot")}
+    if cfg.get("bootstrap_samples", 0) > 0:
+        metrics["ci"] = bootstrap_ci(df, scores, imp_auc, cfg["bootstrap_samples"], cfg["ci_level"], seed)
     return metrics
 
 
@@ -55,8 +91,10 @@ def train(config: dict) -> None:
     beh = load_behaviors(data_dir / config["data"]["behaviors"])
     news = load_news(data_dir / config["data"]["news"])
     emb = load_entity_embeddings(data_dir / config["data"]["entity_embeddings"])
-    store = ArticleStore(data_dir / config["embeddings"]["chroma_dir"], config["embeddings"]["collection"])
-    abstract_vec = store.vectors(news["news_id"].tolist())
+    store = abstract_vec = None
+    if set(EMBEDDING_FEATURES) & set(features):  # the vector database is only needed for these
+        store = ArticleStore(data_dir / config["embeddings"]["chroma_dir"], config["embeddings"]["collection"])
+        abstract_vec = store.vectors(news["news_id"].tolist())
 
     print("building features")
     split = config["split"]
@@ -77,7 +115,8 @@ def train(config: dict) -> None:
               eval_set=[(valid_df[features], valid_df["label"])], verbose=100)
 
     scores = model.predict_proba(test_df[features])[:, 1]
-    metrics = evaluate(test_df, scores) | {"best_iteration": int(model.best_iteration)}
+    metrics = evaluate(test_df, scores, config.get("evaluation", {}), seed)
+    metrics["best_iteration"] = int(model.best_iteration)
     print(json.dumps(metrics, indent=2))
 
     importance = pd.Series(model.get_booster().get_score(importance_type="gain"))

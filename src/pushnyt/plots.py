@@ -19,6 +19,8 @@ GROUPS = {
                                  "hours_since_last_impr", "hours_since_last_slot_impr"}),
     "Embedding retrieval": ("#e87ba4", {"emb_sim_mean", "emb_sim_max", "emb_sim_top5", "emb_n_close",
                                         "emb_retrieval_rank"}),
+    "Article recency": ("#8a5cd1", {"article_age_hours"}),
+    "User depth": ("#7a6f5f", {"user_history_len", "user_prior_impr"}),
 }
 SURFACE, TEXT, TEXT_MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 

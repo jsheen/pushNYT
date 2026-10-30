@@ -1,6 +1,6 @@
 """Features for predicting a click on (user, article) at a time slot (morning/afternoon/evening).
 
-Five feature groups:
+Seven feature groups:
   - time-slot engagement: how the user has engaged in this slot before
   - similarity: candidate article vs. the user's reading history
   - complementarity: Alibaba-style s_ab = p_ab - q_ab over subcategories
@@ -9,6 +9,8 @@ Five feature groups:
   - push fatigue: articles recently shown and skipped in this slot, plus overall volume
   - embedding retrieval: candidate vs. history in sentence-embedding space, using the
     abstract vectors in the local vector database (see embed.py)
+  - article recency: hours since the article was first seen (MIND has no publish time)
+  - user depth: how much we know about the user (pre-period history, impressions logged so far)
 
 Every per-user temporal feature uses only impressions strictly before the current one.
 """
@@ -25,6 +27,8 @@ from sklearn.preprocessing import normalize
 from pushnyt.data import explode_impressions
 from pushnyt.vectordb import ArticleStore
 
+EMBEDDING_FEATURES = ["emb_sim_mean", "emb_sim_max", "emb_sim_top5", "emb_n_close", "emb_retrieval_rank"]
+
 FEATURES = [
     # time-slot engagement
     "slot", "slot_prior_impr", "slot_prior_clicks", "slot_engaged_rate", "slot_click_share",
@@ -36,7 +40,11 @@ FEATURES = [
     "slot_skipped_72h", "slot_skip_rate_72h", "impr_last_24h",
     "hours_since_last_impr", "hours_since_last_slot_impr",
     # embedding retrieval
-    "emb_sim_mean", "emb_sim_max", "emb_sim_top5", "emb_n_close", "emb_retrieval_rank",
+    *EMBEDDING_FEATURES,
+    # article recency
+    "article_age_hours",
+    # user depth
+    "user_history_len", "user_prior_impr",
 ]
 
 
@@ -128,6 +136,7 @@ def temporal_features(beh: pd.DataFrame, fit_end: pd.Timestamp, prior_strength: 
 
     out = pd.DataFrame(index=df.index)
     out["slot_prior_impr"] = by_slot.cumcount()
+    out["user_prior_impr"] = by_user.cumcount()
     out["slot_prior_clicks"] = by_slot["n_clicks"].cumsum() - df["n_clicks"]
     out["slot_engaged_rate"] = ((out["slot_prior_clicks"] + base_rate * prior_strength)
                                 / (shown_before + prior_strength))
@@ -144,6 +153,20 @@ def temporal_features(beh: pd.DataFrame, fit_end: pd.Timestamp, prior_strength: 
     out["hours_since_last_impr"] = by_user["time"].diff().dt.total_seconds() / 3600
     out["hours_since_last_slot_impr"] = by_slot["time"].diff().dt.total_seconds() / 3600
     return out
+
+
+def article_first_seen(beh: pd.DataFrame, rows: pd.DataFrame, H: sparse.csr_matrix) -> np.ndarray:
+    """Earliest time each article was shown in any impression, as a proxy for publish time.
+
+    Articles in a pre-period click history predate the log, so they are capped at its start
+    (their age is then a lower bound). Never-seen articles are NaT.
+    """
+    first = np.full(H.shape[1], np.datetime64("NaT"), "datetime64[ns]")
+    shown = pd.Series(beh["time"].to_numpy()[rows["row"]]).groupby(rows["news"].to_numpy()).min()
+    first[shown.index] = shown.to_numpy()
+    in_history = np.diff(H.tocsc().indptr) > 0
+    first[in_history] = np.fmin(first[in_history], beh["time"].min().to_datetime64())
+    return first
 
 
 def embedding_features(u: np.ndarray, a: np.ndarray, H: sparse.csr_matrix, abstract_vec: np.ndarray,
@@ -183,12 +206,13 @@ def embedding_features(u: np.ndarray, a: np.ndarray, H: sparse.csr_matrix, abstr
 
 
 def build_features(beh: pd.DataFrame, news: pd.DataFrame, entity_emb: dict[str, np.ndarray],
-                   abstract_vec: np.ndarray, store: ArticleStore,
+                   abstract_vec: np.ndarray | None, store: ArticleStore | None,
                    fit_end: pd.Timestamp, cfg: dict, seed: int) -> pd.DataFrame:
     """Feature rows for every candidate shown at or after `fit_end`.
 
     Impressions before `fit_end` are used only to fit the complement matrix
-    (and as earlier history for the temporal features).
+    (and as earlier history for the temporal features). With no `store`, the embedding
+    retrieval features are skipped.
     """
     news_idx = dict(zip(news["news_id"], range(len(news))))
     subcat, subcat_names = news["subcategory"].factorize()
@@ -206,6 +230,7 @@ def build_features(beh: pd.DataFrame, news: pd.DataFrame, entity_emb: dict[str, 
     rows["user"] = beh["user_id"].map(user_idx).to_numpy()[rows["row"]]
     rows["subcat"] = subcat[rows["news"]]
     is_fit = (beh["time"] < fit_end).to_numpy()[rows["row"]]
+    first_seen = article_first_seen(beh, rows, H)  # uses all rows; min over times <= t never looks ahead
 
     s = fit_complements(rows[is_fit], sparse.csr_matrix(subcat_weights > 0), n_sub)
     complement_by_user = subcat_weights @ s  # weighted mean of s[a, b] over the user's subcategories a
@@ -222,13 +247,17 @@ def build_features(beh: pd.DataFrame, news: pd.DataFrame, entity_emb: dict[str, 
     rows.loc[no_hist, ["sim_text", "sim_entity", "subcat_affinity", "complement_score"]] = np.nan
     rows.loc[rows["sim_entity"] == 0, "sim_entity"] = np.nan  # article or history has no entities
 
-    emb_cols = embedding_features(u, a, H, abstract_vec, store, news["news_id"].to_numpy(), cfg)
-    rows[emb_cols.columns] = emb_cols.to_numpy()
-    rows.loc[no_hist, emb_cols.columns] = np.nan
+    if store is not None:
+        emb_cols = embedding_features(u, a, H, abstract_vec, store, news["news_id"].to_numpy(), cfg)
+        rows[emb_cols.columns] = emb_cols.to_numpy()
+        rows.loc[no_hist, emb_cols.columns] = np.nan
+
+    rows["user_history_len"] = np.diff(H.indptr)[u]  # 0 = cold-start user; deliberately not NaN
 
     temporal = temporal_features(beh, fit_end, cfg["ctr_prior_strength"])
     rows = rows.join(temporal, on="row")
     rows["slot"] = beh["slot"].to_numpy()[rows["row"]]
     rows["impression_id"] = beh["impression_id"].to_numpy()[rows["row"]]
     rows["time"] = beh["time"].to_numpy()[rows["row"]]
+    rows["article_age_hours"] = (rows["time"].to_numpy() - first_seen[a]) / np.timedelta64(1, "h")
     return rows
