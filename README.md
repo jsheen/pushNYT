@@ -53,6 +53,8 @@ gs://pushnyt-data ──sync-data.sh──▶ data/
    calibrated, risk-adjusted threshold and a daily cap). It runs in its own lightweight image, so
    both can be changed in seconds without retraining.
 5. **Serve** — `pushnyt-api` exposes scores and push decisions over HTTP (see [API](#api)).
+6. **Analyze** — `pushnyt-exploration` and `pushnyt-fatigue` look at user behavior over the whole
+   log (do novel clicks stick? does heavy exposure tire users?) and write to `outputs/analysis/`.
 
 ### Time-based split
 
@@ -102,7 +104,7 @@ impression-level bootstrap CIs (1,000 replicates):
 |--------|------------------------------|-------------------------------------------------|
 | AUC | 0.646 (0.644–0.649) | **0.656** (0.653–0.659) |
 | Group AUC | 0.617 (0.614–0.620) | **0.622** (0.619–0.625) |
-| Log loss | 0.1571 | **0.1566** |
+| Log loss (before calibration) | 0.1571 | **0.1566** |
 | AUC, morning | 0.654 (0.651–0.658) | **0.669** (0.665–0.673) |
 | AUC, afternoon | 0.634 (0.629–0.640) | **0.639** (0.633–0.644) |
 | AUC, evening | 0.642 (0.635–0.648) | **0.645** (0.638–0.651) |
@@ -509,7 +511,8 @@ or vector database. It covers the AUC/bootstrap math and quality gate, calibrati
 rankings, fixes overconfidence), return labels and censoring, the objective (friction bounds and
 endpoints, scale-invariance), the send policy (risk-adjusted threshold, daily cap order), the
 no-lookahead guarantees of the recency and novelty
-features, an end-to-end train → objective run, and every API endpoint.
+features, the exploration and fatigue analyses (on planted effects), an end-to-end train →
+objective run, and every API endpoint including `/metrics` and the request logs.
 
 ### CI/CD
 
@@ -538,6 +541,7 @@ outputs/
   baseline-no-emb/        # original groups minus embedding retrieval
   recency-depth-no-emb/   # adds article recency + user depth, minus embedding retrieval
   full/                   # default: every feature group
+  analysis/               # pushnyt-exploration and pushnyt-fatigue: exploration.*, fatigue.*
 ```
 
 | File | Contents |
