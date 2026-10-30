@@ -6,6 +6,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # no display inside the container
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from matplotlib.patches import Patch
 from matplotlib.ticker import MultipleLocator
@@ -25,6 +26,7 @@ GROUPS = {
 }
 SURFACE, TEXT, TEXT_MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 MODEL = "#2a78d6"  # categorical slot 1
+SECOND = "#eb6834"  # categorical slot 2
 
 
 def plot_importance(importance: pd.Series, path: Path) -> None:
@@ -105,5 +107,145 @@ def plot_tradeoff(curves: pd.DataFrame, path: Path, friction: float) -> None:
     ax.legend(handles[::-1], labels[::-1], loc="upper right", frameon=False, labelcolor=TEXT, handlelength=4)
 
     fig.tight_layout()
+    fig.savefig(path, dpi=200, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def _style(ax, title: str, subtitle: str) -> None:
+    ax.grid(color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis="both", length=0, colors=TEXT_MUTED)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_title(title, loc="left", color=TEXT, fontsize=13, fontweight="bold", pad=28)
+    ax.text(0, 1.035, subtitle, transform=ax.transAxes, color=TEXT_MUTED, fontsize=9)
+
+
+def plot_calibration(y: np.ndarray, raw: np.ndarray, calibrated: np.ndarray, path: Path) -> None:
+    """Reliability diagram: predicted vs. observed click rate in 20 equal-count bins."""
+    from pushnyt.calibration import reliability
+
+    fig, ax = plt.subplots(figsize=(7, 6), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    top = 0
+    for p, color, ls, mfc, label in [(raw, TEXT_MUTED, (0, (4, 3)), SURFACE, "Raw XGBoost"),
+                                      (calibrated, MODEL, "-", MODEL, "Platt-calibrated")]:
+        pred, obs, _ = reliability(y, p)
+        top = max(top, pred.max(), obs.max())
+        ax.plot(pred, obs, color=color, lw=2, ls=ls, marker="o", ms=8, mfc=mfc,
+                mec=SURFACE if mfc == MODEL else color, mew=2, label=label)
+    top *= 1.08
+    ax.plot([0, top], [0, top], color=GRID, lw=1.5, zorder=0)
+    ax.annotate("perfect calibration", (top * 0.62, top * 0.62), rotation=45, color=TEXT_MUTED, fontsize=9,
+                ha="center", va="bottom", rotation_mode="anchor", transform_rotates_text=True)
+    ax.xaxis.set_major_locator(MultipleLocator(0.02))
+    ax.yaxis.set_major_locator(MultipleLocator(0.02))
+    ax.set_xlim(0, top)
+    ax.set_ylim(0, top)
+    ax.xaxis.set_major_formatter(lambda x, _: f"{x:.0%}")
+    ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    ax.set_xlabel("Predicted click probability (bin mean)", color=TEXT_MUTED)
+    ax.set_ylabel("Observed click rate", color=TEXT_MUTED)
+    _style(ax, "Click model calibration", "Test day, 20 equal-count bins; on the diagonal = predictions mean what they say")
+    ax.legend(loc="upper left", frameon=False, labelcolor=TEXT, handlelength=4)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def plot_volume(volume: pd.DataFrame, path: Path, threshold: float, min_candidates: int) -> None:
+    """Pushes per user-day vs. click rate of the pushes sent, one point per send threshold."""
+    fig, ax = plt.subplots(figsize=(8, 5.6), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    series = [("all", "All users", TEXT_MUTED, (0, (4, 3)), SURFACE),
+              ("low risk", "Low-risk users (likely to return)", MODEL, "-", MODEL),
+              ("high risk", "High-risk users (unlikely to return)", SECOND, "-", SECOND)]
+    for group, label, color, ls, mfc in series:
+        g = volume[volume["group"] == group].sort_values("threshold")
+        ax.plot(g["pushes_per_user_day"], g["ctr_sent"], color=color, lw=2, ls=ls, marker="o", ms=8,
+                mfc=mfc, mec=color if mfc == SURFACE else SURFACE, mew=2, label=label)
+        chosen = g[g["threshold"] == threshold].iloc[0]
+        if group == "all":
+            ax.annotate(f"threshold {threshold:g} (config)", (chosen["pushes_per_user_day"], chosen["ctr_sent"]),
+                        xytext=(8, 8), textcoords="offset points", color=TEXT, fontsize=9, fontweight="bold")
+        for _, r in g[g["threshold"].isin({g["threshold"].min(), g["threshold"].max()})].iterrows():
+            if group == "all":
+                ax.annotate(f"threshold {r['threshold']:g}", (r["pushes_per_user_day"], r["ctr_sent"]),
+                            xytext=(8, -14), textcoords="offset points", color=TEXT_MUTED, fontsize=9)
+    ax.yaxis.set_major_locator(MultipleLocator(0.02))
+    ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    ax.set_xlim(0, None)
+    ax.set_ylim(0, volume["ctr_sent"].max() * 1.15)
+    ax.set_xlabel("Pushes sent per active user per day", color=TEXT_MUTED)
+    ax.set_ylabel("Click-through rate of pushes sent", color=TEXT_MUTED)
+    _style(ax, "Send policy: fewer, better pushes as the threshold rises",
+           f"Test day, impressions with {min_candidates}+ candidates; at-risk users face a higher threshold")
+    ax.legend(loc="upper right", frameon=False, labelcolor=TEXT, handlelength=4)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def plot_exploration(summary: pd.DataFrame, path: Path, rare: float, follow_up_hours: float) -> None:
+    """Later click rate in a subcategory, by how familiar it was and the first response to it."""
+    buckets = list(summary["bucket"].cat.categories)
+    labels = {"Never shown": "Never shown\nbefore", "Rarely shown": f"Rarely shown\n(<{rare:.0%} of exposure)",
+              "Familiar": "Familiar"}
+    series = [("Clicked the first time", MODEL), ("Shown and skipped", TEXT_MUTED)]
+    fig, ax = plt.subplots(figsize=(8, 5.6), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    width = 0.36
+    for i, (first, color) in enumerate(series):
+        g = summary[summary["first"] == first].set_index("bucket").reindex(buckets)
+        x = np.arange(len(buckets)) + (i - 0.5) * (width + 0.02)  # 2-unit gap between paired bars
+        ax.bar(x, g["rate"], width, color=color, label=first, zorder=2)
+        ax.errorbar(x, g["rate"], yerr=g["ci"], fmt="none", ecolor=TEXT, elinewidth=1, capsize=3, zorder=3)
+        for xi, r, ci in zip(x, g["rate"], g["ci"]):
+            ax.text(xi, r + ci + 0.006, f"{r:.0%}", ha="center", va="bottom", color=TEXT, fontsize=9)
+    ax.set_xticks(np.arange(len(buckets)), [labels[b] for b in buckets], color=TEXT)
+    ax.yaxis.set_major_locator(MultipleLocator(0.05))
+    ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    ax.set_ylim(0, (summary["rate"] + summary["ci"]).max() * 1.2)
+    ax.set_xlabel("Subcategory at the user's first exposure in the log", color=TEXT_MUTED)
+    ax.set_ylabel("Click it again when shown it later", color=TEXT_MUTED)
+    _style(ax, "Do clicks on unfamiliar subcategories stick?",
+           f"MIND, Nov 9–14 2019; first exposures with {follow_up_hours:g}h+ of follow-up; "
+           "users shown the subcategory again; 95% CIs")
+    ax.grid(axis="x", visible=False)
+    ax.legend(loc="upper right", frameon=False, labelcolor=TEXT)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def plot_fatigue(table: pd.DataFrame, path: Path, n_users: int, min_impressions: int) -> None:
+    """Fatigue index by recent and cumulative exposure, as two panels on one y-scale."""
+    views = list(dict.fromkeys(table["view"]))
+    fig, axes = plt.subplots(1, len(views), figsize=(10, 5.2), sharey=True, facecolor=SURFACE)
+    lo, hi = table["lo"].min(), table["hi"].max()
+    pad = (hi - lo) * 0.25
+    for ax, view in zip(axes, views):
+        g = table[table["view"] == view]
+        x = np.arange(len(g))
+        ax.set_facecolor(SURFACE)
+        ax.axhline(1.0, color=TEXT_MUTED, lw=1, ls=(0, (4, 3)), zorder=1)
+        ax.fill_between(x, g["lo"], g["hi"], color=MODEL, alpha=0.15, lw=0, zorder=2)
+        ax.plot(x, g["index"], color=MODEL, lw=2, marker="o", ms=8, mec=SURFACE, mew=2, zorder=3)
+        ax.set_xticks(x, [f"{b}\n{n:,} users" for b, n in zip(g["bucket"], g["users"])], color=TEXT, fontsize=9)
+        ax.set_xlabel(view, color=TEXT_MUTED)
+        ax.set_xlim(-0.6, len(g) - 0.4)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.yaxis.set_major_formatter(lambda v, _: f"{v:.2f}")
+        ax.grid(axis="y", color=GRID, linewidth=0.8)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis="both", length=0, colors=TEXT_MUTED)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+    axes[0].set_ylabel("Clicks vs. the user's usual (dashed 1.00 = usual)", color=TEXT_MUTED)
+    fig.suptitle("Fatigue: engagement after recent and cumulative exposure", x=0.07, ha="left",
+                 color=TEXT, fontsize=13, fontweight="bold", y=0.96)
+    fig.text(0.07, 0.885, f"MIND, Nov 9–14 2019; {n_users:,} users with {min_impressions}+ impressions; "
+             "adjusted for impression size; 95% CIs resample users", color=TEXT_MUTED, fontsize=9)
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.84, bottom=0.17, wspace=0.1)
     fig.savefig(path, dpi=200, facecolor=SURFACE)
     plt.close(fig)

@@ -26,6 +26,22 @@ jobs:
       - name: Test
         run: uv run pytest -q   # synthetic data only; no MIND files or vector database needed
 
+  api-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.api
+          load: true
+          tags: pushnyt-api:ci
+          cache-from: type=gha,scope=api
+      - name: Start the container and hit /health, /push, /metrics
+        run: scripts/smoke-api.sh pushnyt-api:ci
+
   docker:
     runs-on: ubuntu-latest
     strategy:

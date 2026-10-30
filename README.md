@@ -31,12 +31,12 @@ gs://pushnyt-data ──sync-data.sh──▶ data/
                               pushnyt-train            (train container)
                                      │
                                      ▼
-          outputs/<run>/  (model, metrics, feature importance, predictions.parquet)
+          outputs/<run>/  (click model + calibration, return model, metrics, predictions.parquet)
                                      │
                             pushnyt-objective          (objective container)
                                      │
                                      ▼
-          outputs/<run>/objective/  (engagement-vs-novelty tradeoff, chosen pushes)
+          outputs/<run>/objective/  (engagement-vs-novelty tradeoff, send policy, chosen pushes)
 
           outputs/<run>/predictions.parquet ──▶ pushnyt-api  (api container, :8000)
 ```
@@ -45,12 +45,13 @@ gs://pushnyt-data ──sync-data.sh──▶ data/
 2. **Embed** — `pushnyt-embed` encodes every article abstract (falling back to the title when
    the abstract is empty) with `sentence-transformers/all-MiniLM-L6-v2` and stores the vectors
    in Chroma (`data/chroma`, collection `abstracts`).
-3. **Train** — `pushnyt-train` builds features, trains XGBoost with early stopping, evaluates on
-   a held-out day, and writes artifacts to `outputs/<run>/`, including per-candidate test-set
-   predictions in `predictions.parquet`.
-4. **Objective** — `pushnyt-objective` re-ranks those predictions with the push objective below
-   (engagement vs. novelty, set by a friction parameter). It runs in its own lightweight image, so
-   friction can be changed in seconds without retraining.
+3. **Train** — `pushnyt-train` builds features, trains XGBoost with early stopping, calibrates its
+   probabilities, fits a return model (a churn proxy), evaluates on a held-out day, and writes
+   artifacts to `outputs/<run>/`, including per-candidate test-set predictions in `predictions.parquet`.
+4. **Objective** — `pushnyt-objective` picks one push per impression with the push objective below
+   (engagement vs. novelty, set by a friction parameter), then decides whether to send it (a
+   calibrated, risk-adjusted threshold and a daily cap). It runs in its own lightweight image, so
+   both can be changed in seconds without retraining.
 5. **Serve** — `pushnyt-api` exposes scores and push decisions over HTTP (see [API](#api)).
 
 ### Time-based split
@@ -174,21 +175,187 @@ roughly 0.5 the model keeps less and less of its edge. CTR is measured against l
 it only credits pushes that were in the original candidate set, which likely understates how
 novel pushes would do.
 
+### Calibration
+
+A ranking only needs scores in the right order. A **send/don't-send decision** needs them to be
+right in absolute terms: of all pushes scored 0.10, about 10% should be clicked. That property is
+calibration, and models trained for ranking often lack it (gradient boosting with early stopping
+tends to be over- or under-confident in the tails).
+
+`pushnyt-train` applies **Platt scaling**: it fits `p = sigmoid(a · logit(raw) + b)` on the
+held-out early-stopping slice and applies it to the test day. The mapping is strictly increasing,
+so rankings, AUC, and the push objective's choices are unchanged; only the probability scale
+moves. (Isotonic regression is the more flexible alternative, but it creates ties, which would
+change the objective's rankings.)
+
+![Calibration](docs/calibration.png)
+
+| | Raw XGBoost | Calibrated |
+|---|---|---|
+| Expected calibration error (ECE) | 0.35 pts | **0.24 pts** |
+| Brier score | 0.03635 | **0.03630** |
+| Top bin: predicted → observed | 13.2% → 10.9% | **11.1% → 10.9%** |
+
+On average the raw model was already close; the fix matters at the top, where it was
+**overconfident**, and the top is exactly where a send threshold operates. ECE is the
+count-weighted mean gap between predicted and observed rates over 20 equal-count bins.
+
+**A MIND caveat.** Calibration is per *candidate*. It does not make the *chosen* push calibrated,
+because MIND only logs impressions that contain a click: in impressions with ≤10 candidates, 18.6%
+of candidates are clicked (the model predicts 4.8%); with >100, 1.9% (it predicts 3.8%). The model
+cannot see impression size, and real pushes have no guaranteed click. So the send policy below is
+evaluated on impressions with 50+ candidates, where the artifact is weakest; within those, the
+model's top picks still click at a higher rate as its prediction rises (3.6% → 8.5% across
+quintiles), though it over-predicts their level.
+
+### Return model (churn proxy)
+
+The real cost of a bad push is a reader turning notifications off. MIND has no opt-out events, so
+`pushnyt-train` fits a proxy: **P(the user has another impression within 24 hours)**, an XGBoost
+model on user depth and fatigue features (`src/pushnyt/risk.py`). Risk = 1 − P(return).
+
+- Labels are censored near the end of the log, so it trains on impressions before `fit_end`,
+  is evaluated on `[fit_end, train_end)` (**AUC 0.743**, 54% return rate), and only scores the test day.
+- It is a **user-level** signal: it mostly measures how active someone is, not what a push did to
+  them. Subtracting it from the per-article score would barely change which article wins (it is
+  nearly constant within an impression), so it sets **how much** to send each user, not **what**.
+
+### Send policy
+
+For each impression's top pick (at the configured friction), `pushnyt-objective` sends it only if
+
+```
+calibrated P(click) ≥ threshold + risk_penalty · (1 − P(return))
+```
+
+and the user has had fewer than `daily_cap` pushes that day (earliest first; the policy can't see
+later impressions). Defaults in `configs/objective.yml`: threshold 0.07, risk penalty 0.04, cap 2.
+At-risk users therefore only get pushes the model is more confident about.
+
+![Send policy](docs/volume.png)
+
+On impressions with 50+ candidates:
+
+| Threshold | Pushes per active user-day | CTR of pushes sent | Predicted CTR |
+|-----------|----------------------------|--------------------|---------------|
+| 0 (send all, cap 2) | 1.15 | 5.3% | 8.1% |
+| 0.05 | 0.72 | 6.4% | 9.4% |
+| **0.07 (default)** | **0.41** | **7.9%** | 10.9% |
+| 0.10 | 0.14 | 10.3% | 13.9% |
+| 0.15 | 0.02 | 17.4% | 19.1% |
+
+Raising the threshold trades volume for quality as intended. At the default, low-risk users get
+0.82 pushes/day at 9.3% CTR and high-risk users 0.15/day at 5.3%. The model over-predicts
+on this slice, most for high-risk users, which is the impression-size caveat above plus a sign
+that a production calibrator should be fit per user segment.
+
+### Production: plugging in real opt-out data
+
+In production the return proxy should be replaced by a model of actual notification opt-outs.
+What NYT would need to log:
+
+| Event | Fields | Used for |
+|-------|--------|----------|
+| Push sent | user, article, time, slot, model scores, **send probability** | Training data; off-policy evaluation of new policies |
+| Push opened | user, article, time | The click label (replaces MIND impressions) |
+| Push dismissed | user, article, time | Article-level negative feedback |
+| Notifications disabled / app uninstalled | user, time, pushes in the prior 7 days | The opt-out model's label |
+
+A user-level opt-out model drops straight into the send policy in place of `p_return`. Dismissals
+and opt-outs shortly after a specific push are what an **article-level** risk term would need,
+added to the score as `(1 − f) · engagement + f · novelty − λ · risk`; MIND has nothing comparable,
+so that term is not built here.
+
+### Do clicks on unfamiliar subcategories stick?
+
+The novelty term pays a click cost now on the bet that new interests last. MIND can partly test
+that bet. `pushnyt-exploration` takes each user's **first exposure** in the log to each
+subcategory, notes whether they clicked it and how unfamiliar it was at that moment, and then asks:
+among users shown that subcategory again later, what share click it?
+
+![Exploration conversion](docs/exploration.png)
+
+| Subcategory at first exposure | Clicked the first time | Shown and skipped | Ratio |
+|-------------------------------|------------------------|-------------------|-------|
+| Never shown before | 17.6% | 7.4% | **2.4×** |
+| Rarely shown (<10% of exposure) | 32.9% | 22.7% | 1.5× |
+| Familiar | 51.7% | 36.4% | 1.4× |
+
+(First exposures with at least 48h of log left; 20k–380k re-exposed users per bar; 95% CIs ≤ ±1 point.)
+
+Users come back to familiar subcategories far more often, as expected. But a first click on a
+**never-shown** subcategory goes with a 2.4× higher chance of clicking it again, the biggest
+relative gap of the three: an unfamiliar click that lands is followed by real, repeated interest,
+not just a one-off. That supports the novelty term's premise.
+
+**Caveats.** This is observational and on feed clicks, not pushes: users who click unfamiliar
+topics may simply be more curious, so it shows association, not that a push *creates* interest.
+The follow-up is at most a few days, and a user can only re-click what the feed showed them again
+(hence conditioning on re-exposure). The causal version is an experiment: randomize friction and
+measure later organic reading of the new subcategories.
+
+```bash
+docker compose run --rm train "pushnyt-exploration"   # writes outputs/analysis/exploration.{csv,png}
+```
+
+### Fatigue: do users engage less after heavy exposure?
+
+The send policy's daily cap assumes more pushes means less attention to each. `pushnyt-fatigue`
+checks what MIND shows. Heavy users differ from light ones, so each user is compared with **their
+own** usual engagement: for every impression, expected clicks = impression size × the click rate
+for impressions of that size (MIND's logging inflates small ones), scaled by the user's own
+actual-to-expected ratio. The index is actual ÷ expected clicks: 1.00 = usual, below = fatigued.
+Users with 5+ impressions (9,725); 95% CIs resample users.
+
+![Fatigue](docs/fatigue.png)
+
+| Impressions in the previous 24h | 0 | 1 | 2 | 3–4 | 5+ |
+|---|---|---|---|---|---|
+| Engagement vs. usual | **1.019** | 0.994 | 0.997 | 0.991 | **0.983** |
+
+| Impressions earlier in the week | 0 | 1–2 | 3–5 | 6–10 | 11+ |
+|---|---|---|---|---|---|
+| Engagement vs. usual | 1.016 | 0.994 | 0.997 | 1.000 | 1.008 |
+
+- **Short-term fatigue is real but small.** Users engage about 2% above their norm when they have
+  not been seen in the past day and about 2% below it after 5+ impressions; the intervals at the
+  two ends don't overlap. Freshness matters: the first impression after a gap does best.
+- **No cumulative fatigue over the week.** Engagement does not keep falling with total exposure; the
+  heaviest users are back at their norm, likely because people who keep coming back are the
+  engaged ones.
+- **What it supports:** a *daily* cap and spacing pushes out (both in the send policy and the
+  `hours_since_last_impr` feature), rather than a weekly budget.
+
+**Caveats.** Feed impressions are started by the user, while pushes arrive unprompted, so push
+fatigue is very likely stronger than this, and MIND can't show the outcome that matters most:
+users turning notifications off. Six days is also short for "long term." The production version is
+the volume experiment in the roadmap: randomize daily caps for several weeks and track CTR and
+opt-outs over time.
+
+```bash
+docker compose run --rm train "pushnyt-fatigue"       # writes outputs/analysis/fatigue.{csv,png}
+```
+
 ## Repository layout
 
 ```
 configs/train.yml       # all data, split, feature, embedding, and model settings
 configs/objective.yml   # push objective: which run to re-rank, friction, sweep
 scripts/sync-data.sh    # pull gs://pushnyt-data into ./data
+scripts/smoke-api.sh    # start the API image on a fixture run and check it responds (used by CI)
 src/pushnyt/
   data.py               # MIND loaders, time-slot bucketing
   embed.py              # pushnyt-embed: abstract embeddings -> Chroma
   vectordb.py           # thin Chroma wrapper (add / fetch vectors / nearest neighbors)
   features.py           # feature engineering
   train.py              # pushnyt-train: fit, evaluate, save artifacts
-  objective.py          # pushnyt-objective: engagement vs. novelty re-ranking
+  calibration.py        # Platt scaling, reliability bins, ECE
+  risk.py               # return model (churn proxy)
+  exploration.py        # pushnyt-exploration: do clicks on unfamiliar subcategories stick?
+  fatigue.py            # pushnyt-fatigue: engagement after recent and cumulative exposure
+  objective.py          # pushnyt-objective: engagement vs. novelty re-ranking + send policy
   api.py                # pushnyt-api: FastAPI serving app
-  plots.py              # feature-importance and trade-off charts
+  plots.py              # all charts (importance, calibration, trade-off, send policy, analyses)
 tests/                  # pytest suite on synthetic MIND-style data
 .github/workflows/      # ci.yml (lint, test, build images), release.yml (publish images)
 Dockerfile              # training image (torch, xgboost, chroma: the `train` extra)
@@ -293,7 +460,8 @@ Interactive docs are at <http://localhost:8000/docs>.
 | `GET /model` | Run name, excluded features, test metrics |
 | `GET /users/{user_id}/impressions` | A user's impressions in the run, to find ids to score |
 | `POST /score` | `P(click)` and novelty for an impression's candidates, highest first |
-| `POST /push` | The push the objective picks at a given `friction` (default 0.2), with its engagement and novelty ranks and the next four candidates |
+| `GET /metrics` | Prometheus metrics: requests, errors, latency, and push behavior (see Monitoring) |
+| `POST /push` | The push the objective picks at a given `friction` (default 0.2), with its engagement and novelty ranks, whether the send policy would send it (`send`: decision, risk-adjusted threshold, risk), and the next four candidates |
 
 ```bash
 curl localhost:8000/users/U86598/impressions
@@ -303,6 +471,25 @@ curl -X POST localhost:8000/push -H 'content-type: application/json' \
 
 Both `POST` endpoints accept an optional `news_ids` list to restrict the choice to a subset of the
 impression's candidates. Friction outside [0, 1] returns 422; unknown impressions or articles return 404.
+
+The send decision uses the threshold and risk penalty from `configs/objective.yml`. The daily cap
+needs to know what the user was already sent today, so the caller enforces it.
+
+### Monitoring
+
+| Layer | How |
+|-------|-----|
+| **Is it up?** | The API image has a Docker `HEALTHCHECK` on `/health` every 30s; `docker ps` shows `(healthy)` / `(unhealthy)`. Compose restarts the container if the process exits. |
+| **Is it erroring or slow?** | `GET /metrics` (Prometheus format): `pushnyt_requests_total{endpoint,status}` and the `pushnyt_request_seconds` latency histogram. |
+| **Is the model behaving sensibly?** | Also on `/metrics`: `pushnyt_push_decisions_total{decision="send"/"hold"}` (send rate), histograms of the chosen push's `p_click` and `novelty`, the friction callers ask for, and `pushnyt_model_info{run}` / `pushnyt_model_test_auc` for which model is live. |
+| **What happened on a request?** | One JSON log line per request (`docker compose logs api`): endpoint, status, latency, and for `/push` the impression, friction, chosen article, `p_click`, and send decision. |
+
+A sudden change in the send rate or the `p_click` distribution, with no change in traffic, is the
+early warning that something upstream changed: a new training run, a feature bug, or a shift in
+the data. Prometheus can scrape `/metrics` directly (or Google Cloud Managed Service for
+Prometheus on GCP), and the JSON logs work as-is with Cloud Logging. What this can't watch is
+**accuracy**: comparing predicted to actual clicks needs the outcomes of sent pushes logged and
+joined back (see "Production: plugging in real opt-out data").
 
 **Limitation:** the API serves a run's precomputed test-day predictions, so it only knows the
 impressions in that run's `predictions.parquet`. Scoring live requests would need each user's
@@ -318,14 +505,18 @@ docker compose run --rm -v "$PWD/tests:/app/tests" train "uv sync --extra train 
 ```
 
 The suite builds a tiny synthetic MIND-style dataset (`tests/conftest.py`), so it needs no real data
-or vector database. It covers the AUC/bootstrap math and quality gate, the objective (friction
-bounds and endpoints, scale-invariance), the no-lookahead guarantees of the recency and novelty
+or vector database. It covers the AUC/bootstrap math and quality gate, calibration (Platt keeps
+rankings, fixes overconfidence), return labels and censoring, the objective (friction bounds and
+endpoints, scale-invariance), the send policy (risk-adjusted threshold, daily cap order), the
+no-lookahead guarantees of the recency and novelty
 features, an end-to-end train → objective run, and every API endpoint.
 
 ### CI/CD
 
 - **CI** (`.github/workflows/ci.yml`), on every push to `main` and every pull request: `ruff`,
-  `pytest`, and a build of all three Docker images (not pushed).
+  `pytest`, a build of all three Docker images (not pushed), and an API smoke test
+  (`scripts/smoke-api.sh`) that starts the API container on a tiny fixture run and checks that
+  `/health`, `/push`, and `/metrics` respond. Run it locally with `scripts/smoke-api.sh`.
 - **Release** (`.github/workflows/release.yml`), when a version tag is pushed: builds the three
   images and publishes them to GitHub Container Registry as
   `ghcr.io/jsheen/pushnyt-{train,objective,api}`, tagged with the version and `latest`:
@@ -352,15 +543,17 @@ outputs/
 | File | Contents |
 |------|----------|
 | `xgb_click.json` | Trained XGBoost model |
-| `metrics.json` | Test-set AUC, group AUC, log loss, CTR, AUC by slot, bootstrap CIs, best iteration |
+| `metrics.json` | Test-set AUC, group AUC, log loss, CTR, AUC by slot, bootstrap CIs, calibration (Platt parameters, ECE, Brier before/after), return-model AUC, best iteration |
+| `calibration.png` | Reliability diagram, raw vs. calibrated |
 | `feature_importance.csv` | Gain per feature |
 | `feature_importance.png` | Feature-importance chart, colored by feature group |
 | `config.yml` | Config used for the run |
-| `predictions.parquet` | Test-set candidates: impression, user, slot, article, label, `p_click`, `novelty` |
+| `predictions.parquet` | Test-set candidates: impression, user, slot, article, label, `p_click` (calibrated), `p_click_raw`, `novelty`, `p_return` |
 | `objective/tradeoff.csv` | Top-pick CTR and novelty at each friction, for the model and the random-ranking baseline |
 | `objective/tradeoff.png` | Trade-off plot: top-pick CTR vs. never-shown share, model vs. random |
-| `objective/pushes.parquet` | The chosen push per impression at the configured friction, with its score |
-| `objective/summary.json` | Tradeoff row for the configured friction |
+| `objective/pushes.parquet` | The chosen push per impression at the configured friction, with its score and `send` decision |
+| `objective/volume.csv`, `volume.png` | Pushes per user-day vs. CTR of pushes sent at each send threshold, by risk group |
+| `objective/summary.json` | Tradeoff row for the configured friction, plus send-policy results |
 
 ## Status and contact
 

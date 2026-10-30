@@ -19,10 +19,16 @@ def test_train_then_objective(train_config, tmp_path, monkeypatch):
     metrics = json.loads((run / "metrics.json").read_text())
     assert 0 <= metrics["auc"] <= 1 and "ci" in metrics
     preds = pd.read_parquet(run / "predictions.parquet")
-    assert {"impression_id", "user_id", "news_id", "label", "p_click", "novelty"} <= set(preds.columns)
+    assert {"impression_id", "user_id", "news_id", "label", "p_click", "p_click_raw", "novelty",
+            "p_return"} <= set(preds.columns)
+    assert {"calibration", "return_model"} <= set(metrics)
+    assert (run / "calibration.png").exists()
 
     cfg = tmp_path / "objective.yml"
-    cfg.write_text(yaml.safe_dump({"run_dir": str(run), "friction": 0.2, "sweep": [0, 0.5, 1], "seed": 0}))
+    send = {"threshold": 0.05, "risk_penalty": 0.04, "daily_cap": 2, "sweep": [0, 0.05, 0.1],
+            "eval_min_candidates": 1}
+    cfg.write_text(yaml.safe_dump({"run_dir": str(run), "friction": 0.2, "sweep": [0, 0.5, 1], "seed": 0,
+                                   "send": send}))
     monkeypatch.setattr(sys, "argv", ["pushnyt-objective", "--config", str(cfg)])
     objective.main()
     out = run / "objective"
@@ -30,4 +36,7 @@ def test_train_then_objective(train_config, tmp_path, monkeypatch):
     assert set(curve["policy"]) == {"model", "random"}
     pushes = pd.read_parquet(out / "pushes.parquet")
     assert len(pushes) == preds["impression_id"].nunique()
+    assert "send" in pushes
     assert (out / "tradeoff.png").exists() and (out / "summary.json").exists()
+    assert (out / "volume.png").exists() and set(pd.read_csv(out / "volume.csv")["group"]) == {
+        "all", "low risk", "high risk"}

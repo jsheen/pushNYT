@@ -11,9 +11,11 @@ import xgboost as xgb
 import yaml
 from sklearn.metrics import log_loss, roc_auc_score
 
+from pushnyt.calibration import apply_platt, calibration_metrics, fit_platt
 from pushnyt.data import SLOTS, load_behaviors, load_entity_embeddings, load_news
-from pushnyt.features import EMBEDDING_FEATURES, FEATURES, build_features
-from pushnyt.plots import plot_importance
+from pushnyt.features import EMBEDDING_FEATURES, FEATURES, build_features, temporal_features
+from pushnyt.plots import plot_calibration, plot_importance
+from pushnyt.risk import fit_return_model
 from pushnyt.vectordb import ArticleStore
 
 
@@ -121,8 +123,20 @@ def train(config: dict) -> None:
     model.fit(fit_df[features], fit_df["label"],
               eval_set=[(valid_df[features], valid_df["label"])], verbose=100)
 
-    scores = model.predict_proba(test_df[features])[:, 1]
+    # Platt-calibrate on the early-stopping slice; monotone, so rankings and AUC are unchanged
+    platt = fit_platt(model.predict_proba(valid_df[features])[:, 1], valid_df["label"].to_numpy())
+    raw = model.predict_proba(test_df[features])[:, 1]
+    scores = apply_platt(raw, platt)
     metrics = evaluate(test_df, scores, config.get("evaluation", {}), seed)
+    y = test_df["label"].to_numpy()
+    metrics["calibration"] = {"platt": platt, "raw": calibration_metrics(y, raw),
+                              "calibrated": calibration_metrics(y, scores)}
+
+    print("fitting return model")
+    temporal = temporal_features(beh, pd.Timestamp(split["fit_end"]), config["features"]["ctr_prior_strength"])
+    p_return, metrics["return_model"] = fit_return_model(
+        beh, temporal, pd.Timestamp(split["fit_end"]), train_end, config["risk"], seed)
+    p_return = pd.Series(p_return, index=beh["impression_id"])
     metrics["best_iteration"] = int(model.best_iteration)
     print(json.dumps(metrics, indent=2))
 
@@ -134,11 +148,14 @@ def train(config: dict) -> None:
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     importance.rename("gain").to_csv(output_dir / "feature_importance.csv")
     # handoff to the push objective (pushnyt-objective), which runs in its own container
-    test_df.assign(news_id=news["news_id"].to_numpy()[test_df["news"]], p_click=scores)[
-        ["impression_id", "user_id", "time", "slot", "news_id", "label", "p_click", "novelty"]
+    test_df.assign(news_id=news["news_id"].to_numpy()[test_df["news"]], p_click=scores, p_click_raw=raw,
+                   p_return=p_return.reindex(test_df["impression_id"]).to_numpy())[
+        ["impression_id", "user_id", "time", "slot", "news_id", "label", "p_click", "p_click_raw",
+         "novelty", "p_return"]
     ].to_parquet(output_dir / "predictions.parquet", index=False)
     check_quality(metrics, config.get("evaluation", {}))  # after saving, so a failed run can be inspected
     plot_importance(importance, output_dir / "feature_importance.png")
+    plot_calibration(y, raw, scores, output_dir / "calibration.png")
 
 
 def main() -> None:

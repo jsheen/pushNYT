@@ -3,3 +3,12 @@ run_dir: outputs/full      # training run whose predictions.parquet to re-rank
 friction: 0.2              # 0 = pure click model, 1 = least-seen subcategory
 sweep: [0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]  # rows of tradeoff.csv / points on tradeoff.png
 seed: 42                   # random-ranking baseline curve
+
+# Send policy: send the top pick only if calibrated P(click) >= threshold + risk_penalty * risk,
+# where risk = 1 - P(user returns within 24h), and at most daily_cap pushes per user per day
+send:
+  threshold: 0.07
+  risk_penalty: 0.04       # at-risk users need a more confident push (up to +0.04 at risk = 1)
+  daily_cap: 2
+  sweep: [0, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.12, 0.15]  # rows of volume.csv / volume.png
+  eval_min_candidates: 50  # evaluate on impressions this large (MIND's logging inflates small ones)

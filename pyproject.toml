@@ -24,6 +24,7 @@ train = [
 ]
 api = [
     "fastapi>=0.115",
+    "prometheus-client>=0.20",
     "uvicorn>=0.30",
 ]
 dev = [
@@ -38,6 +39,8 @@ pushnyt-train = "pushnyt.train:main"
 pushnyt-embed = "pushnyt.embed:main"
 pushnyt-objective = "pushnyt.objective:main"
 pushnyt-api = "pushnyt.api:main"
+pushnyt-exploration = "pushnyt.exploration:main"
+pushnyt-fatigue = "pushnyt.fatigue:main"
 
 [build-system]
 requires = ["hatchling"]
